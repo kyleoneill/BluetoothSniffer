@@ -1,0 +1,7 @@
+Refactor
+- Have btle.rs use a mutex rather than a channel main.rs can read from more easily?
+- Re-draw problem
+
+- Allow mac addresses to be copy-able
+
+TODO: Capture bluetooth packets, like wireshark
