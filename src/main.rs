@@ -2,109 +2,97 @@
 
 mod btle;
 
-use std::thread;
-use std::sync::{Arc, mpsc};
-use std::sync::mpsc::{Sender, Receiver};
+use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
-use btleplug::api::BDAddr;
-use eframe::{egui, Frame};
-use egui::{Context, vec2};
-use std::default::Default;
-use std::thread::JoinHandle;
-use eframe::epaint::Color32;
+use btleplug::api::Peripheral;
+use btleplug::platform::{Peripheral as BluetoothPeripheral, PeripheralId};
+use eframe::{Frame, egui};
 use egui::RichText;
+use egui::vec2;
+use std::default::Default;
+use tokio::time;
+
+use crate::btle::BluetoothListener;
 
 #[derive(Debug, Clone)]
 pub enum BluetoothError {
     AdapterNotFound,
     FailedToScan,
     NoPeripherals,
-    UnknownError
+    UnknownError,
 }
 
-fn main() -> Result<(), eframe::Error> {
+fn main() -> eframe::Result {
     tracing_subscriber::fmt::init();
 
     let options = eframe::NativeOptions {
-        initial_window_size: Some(egui::vec2(640.0, 480.0)),
+        viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 480.0]),
         ..Default::default()
     };
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-
-    // Start a tokio thread
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("bluetooth-scanner")
-        .enable_io()
-        .enable_time()
-        .build()
-        .unwrap();
-
-    let runtime = Arc::new(runtime);
-    let runtime_two = runtime.clone();
-
-    // The tokio thread must be in a thread because runtime.block_on is a blocking operation
-    thread::spawn(move || {
-        // Wait until the receiver on our thread gets a message, then the block finishes and it is dropped
-        runtime.block_on(async move {
-            rx.await
-        });
-    });
-
-    let _guard = runtime_two.enter();
-
-    // TODO: UI only updates when it gets an input event, is there a fix?
-    // Ex, when btle.rs sends an event, the window will only update with new Receive data
-    // if I click on it or mouse over it or some other input event egui listens for
-    //
-    // eframe::App trait below also might have an option to fix this, like some sort of
-    // "request_redraw" method or something similar
     eframe::run_native(
         "Btle Sniffer",
         options,
-        Box::new(|_cc| Box::new(BTLESniffer::new()))
-    );
-
-    // Send a message to the spawned thread, causing it to finish and drop
-    let _ = tx.send(());
-    return Ok(())
+        Box::new(|cc| {
+            let app = SnifferApp::new(cc);
+            Ok(Box::new(app))
+        }),
+    )
 }
 
-struct BTLESniffer {
-    receiver: Option<Receiver<Vec<BDAddr>>>,
+struct SnifferApp {
+    receiver: Receiver<BluetoothPeripheral>,
     error_state: Option<BluetoothError>,
-    addresses: Option<Vec<BDAddr>>
+    peripherals: HashMap<PeripheralId, BluetoothPeripheral>,
 }
 
-impl BTLESniffer {
-    pub fn new() -> Self {
-        return Self{
-            receiver: None,
+impl SnifferApp {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<BluetoothPeripheral>();
+        std::thread::spawn(move || {
+            // We need to build a Tokio runtime to use. egui must control the main thread so we cannot use the handy tokio::main macro to generate a runtime for us
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .thread_name("bluetooth-scanner")
+                .enable_all()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let bluetooth_listener = BluetoothListener::new(tx, 10).await.unwrap();
+                let mut interval = time::interval(Duration::from_secs(1));
+                // The first tick completes instantly
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    // TODO: This can return an error and I should do something about that
+                    // with setting things on error_state
+                    let _res = bluetooth_listener.listen().await;
+                }
+            })
+        });
+        Self {
+            receiver: rx,
             error_state: None,
-            addresses: None
+            peripherals: HashMap::new(),
+        }
+    }
+    fn read_for_peripherals(&mut self) {
+        while let Ok(peripheral) = self.receiver.try_recv() {
+            let _res = self.peripherals.insert(peripheral.id(), peripheral);
         }
     }
 }
 
-impl eframe::App for BTLESniffer {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+impl eframe::App for SnifferApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut Frame) {
+        self.read_for_peripherals();
+
+        // TODO: DISPLAY ERROR IF error_state IS SOME
+        egui::CentralPanel::default().show(ui, |ui| {
             // TODO: Set the spacing here - ui.set_style() <- this needs some style struct
             ui.heading("Bluetooth Low Energy Sniffer");
-            ui.horizontal(|ui| {
-                ui.label("Scan for Bluetooth devices: ");
-                if ui.add(egui::Button::new("Scan")).clicked() {
-                    let (tx, rx): (Sender<Vec<BDAddr>>, Receiver<Vec<BDAddr>>) = mpsc::channel();
-                    self.receiver = Some(rx);
-                    let _handle = tokio::task::spawn(btle::bluetooth_listener(tx, 10));
-                }
-            });
-            // Check if our receiver exists and has info, update addresses state
-            if let Some(receiver) = &self.receiver {
-                if let Ok(addresses) = receiver.try_recv() {
-                    self.addresses = Some(addresses);
-                }
-            }
             egui::Grid::new("btle-data-grid")
                 .striped(true)
                 .spacing(vec2(50f32, 0f32))
@@ -112,16 +100,10 @@ impl eframe::App for BTLESniffer {
                     ui.label("MAC Address");
                     ui.label("Debug");
                     ui.end_row();
-                    match &self.addresses {
-                        Some(addresses) => {
-                            for address in addresses.iter() {
-                                // TODO: Allow this to be copy-able
-                                ui.label(RichText::new(format!("{}", address)));
-                                ui.label("Empty");
-                                ui.end_row();
-                            }
-                        }
-                        None => ()
+                    for peripheral in self.peripherals.values() {
+                        ui.label(RichText::new(peripheral.to_string()));
+                        ui.label("Empty");
+                        ui.end_row();
                     }
                 });
         });
